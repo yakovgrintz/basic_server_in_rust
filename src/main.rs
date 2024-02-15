@@ -7,7 +7,17 @@ use std::{fs, thread};
 
 struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: Option<mpsc::Sender<Job>>,
+}
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        for worker in &mut self.workers {
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
 }
 
 impl ThreadPool {
@@ -19,35 +29,52 @@ impl ThreadPool {
         for id in 0..number_of_thread {
             workers.push(Worker::new(id, Arc::clone(&reciver)));
         }
-        ThreadPool { workers, sender }
+        ThreadPool {
+            workers,
+            sender: Some(sender),
+        }
     }
     fn execute<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
     {
         let job = Box::new(f);
-        self.sender.send(job).unwrap();
+        self.sender.as_ref().unwrap().send(job).unwrap();
     }
 }
+
 struct Worker {
     id: usize,
-    thread: JoinHandle<()>,
+    thread: Option<JoinHandle<()>>,
 }
+
 impl Worker {
     fn new(id: usize, receiver: Arc<Mutex<Receiver<Job>>>) -> Worker {
         let thread = spawn(move || loop {
-            let job = receiver
+            let message = receiver
                 .lock()
                 .expect("Another treadmill is already locked")
-                .recv()
-                .unwrap();
-            println!("job :{} get mission", id);
-            job();
+                .recv();
+            match message {
+                Ok(job) => {
+                    println!("job :{} get mission", id);
+                    job();
+                }
+                Err(_) => {
+                    println!("Worker {id} disconnected; shutting down.");
+                    break;
+                }
+            }
         });
-        Worker { id, thread }
+        Worker {
+            id,
+            thread: Some(thread),
+        }
     }
 }
+
 type Job = Box<dyn FnOnce() + Send + 'static>;
+
 fn main() {
     let ip_address = "127.0.0.1:7878";
     let listener = TcpListener::bind(ip_address).unwrap();
@@ -57,13 +84,9 @@ fn main() {
         thread_pool.execute(|| handle_connection(stream));
     }
 }
+
 fn handle_connection(mut stream: TcpStream) {
     let buf_reader = BufReader::new(&mut stream);
-    // let http_request: Vec<_> = buf_reader
-    //     .lines()
-    //     .map(|result| result.unwrap())
-    //     .take_while(|line| !line.is_empty())
-    //     .collect();
     let request_line = buf_reader.lines().next().unwrap().unwrap();
     let (status_line, file_name) = match &request_line[..] {
         "GET / HTTP/1.1" => ("HTTP/1.1 200 OK", "hello.html"),
